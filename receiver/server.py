@@ -38,6 +38,56 @@ def extract_tar_file(tar_file_path, extract_id):
         print(f"✗ Error during extraction: {str(e)}")
         return False, f"Error during extraction: {str(e)}"
 
+def build_docker_image(extract_dir, architecture, upload_id):
+    """Build Docker image for the specified architecture"""
+    try:
+        # Check if Dockerfile exists
+        dockerfile_path = os.path.join(extract_dir, "Dockerfile")
+        if not os.path.exists(dockerfile_path):
+            return False, "No Dockerfile found in extracted directory"
+        
+        # Generate image name with architecture and upload_id
+        image_name = f"cicd-build-{architecture}-{upload_id[:8]}"
+        
+        # Map architecture names to Docker platform format
+        platform_map = {
+            "x86": "linux/386",
+            "x64": "linux/amd64", 
+            "arm": "linux/arm/v7",
+            "arm64": "linux/arm64"
+        }
+        
+        platform = platform_map.get(architecture, "linux/amd64")
+        
+        # Build Docker command
+        cmd = [
+            "docker", "build",
+            "--platform", platform,
+            "-t", image_name,
+            extract_dir
+        ]
+        
+        print(f"Building Docker image {image_name} for platform {platform}...")
+        print(f"Command: {' '.join(cmd)}")
+        
+        # Run docker build
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"✓ Successfully built Docker image: {image_name}")
+            return True, {
+                "image_name": image_name,
+                "platform": platform,
+                "build_output": result.stdout
+            }
+        else:
+            print(f"✗ Docker build failed: {result.stderr}")
+            return False, f"Docker build failed: {result.stderr}"
+    
+    except Exception as e:
+        print(f"✗ Error during Docker build: {str(e)}")
+        return False, f"Error during Docker build: {str(e)}"
+
 def combine_chunks(original_filename, total_chunks, upload_id):
     """Combine all chunks into the original file"""
     combined_file_path = f"./received_{original_filename}"
@@ -168,14 +218,30 @@ def receive_data():
                     del chunk_tracker[upload_key]
                     
                     if extract_success:
-                        print(f"✓ Successfully combined and extracted {original_filename}")
-                        return jsonify({
-                            "message": f"All chunks received, combined, and extracted successfully",
-                            "id": upload_id,
-                            "architecture": architecture,
-                            "filename": original_filename,
-                            "extracted_to": extract_result
-                        }), 200
+                        # Build Docker image for the specified architecture
+                        build_success, build_result = build_docker_image(extract_result, architecture, upload_id)
+                        
+                        if build_success:
+                            print(f"✓ Successfully combined, extracted, and built Docker image for {original_filename}")
+                            return jsonify({
+                                "message": f"All chunks received, combined, extracted, and Docker image built successfully",
+                                "id": upload_id,
+                                "architecture": architecture,
+                                "filename": original_filename,
+                                "extracted_to": extract_result,
+                                "docker_image": build_result["image_name"],
+                                "platform": build_result["platform"]
+                            }), 200
+                        else:
+                            print(f"✓ Successfully combined and extracted, but Docker build failed: {build_result}")
+                            return jsonify({
+                                "message": f"All chunks received, combined, and extracted successfully, but Docker build failed",
+                                "id": upload_id,
+                                "architecture": architecture,
+                                "filename": original_filename,
+                                "extracted_to": extract_result,
+                                "docker_build_error": build_result
+                            }), 200
                     else:
                         print(f"✗ Combined successfully but extraction failed: {extract_result}")
                         return jsonify({
@@ -210,14 +276,30 @@ def receive_data():
                 extract_success, extract_result = extract_tar_file(tar_file_path, upload_id)
                 
                 if extract_success:
-                    print(f"✓ Successfully received and extracted {file.filename}")
-                    return jsonify({
-                        "message": "File received and extracted successfully", 
-                        "id": upload_id,
-                        "architecture": architecture,
-                        "filename": file.filename,
-                        "extracted_to": extract_result
-                    }), 200
+                    # Build Docker image for the specified architecture
+                    build_success, build_result = build_docker_image(extract_result, architecture, upload_id)
+                    
+                    if build_success:
+                        print(f"✓ Successfully received, extracted, and built Docker image for {file.filename}")
+                        return jsonify({
+                            "message": "File received, extracted, and Docker image built successfully", 
+                            "id": upload_id,
+                            "architecture": architecture,
+                            "filename": file.filename,
+                            "extracted_to": extract_result,
+                            "docker_image": build_result["image_name"],
+                            "platform": build_result["platform"]
+                        }), 200
+                    else:
+                        print(f"✓ Successfully received and extracted, but Docker build failed: {build_result}")
+                        return jsonify({
+                            "message": "File received and extracted successfully, but Docker build failed",
+                            "id": upload_id,
+                            "architecture": architecture,
+                            "filename": file.filename,
+                            "extracted_to": extract_result,
+                            "docker_build_error": build_result
+                        }), 200
                 else:
                     print(f"✗ Received successfully but extraction failed: {extract_result}")
                     return jsonify({
@@ -236,9 +318,44 @@ def receive_data():
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 
+def get_built_docker_images():
+    """Get list of Docker images built by this server"""
+    try:
+        # List Docker images with our naming pattern
+        cmd = ["docker", "images", "--format", "json", "--filter", "reference=cicd-build-*"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            images = []
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    try:
+                        image_info = json.loads(line)
+                        # Parse architecture and upload_id from image name
+                        tag_parts = image_info['Repository'].split('-')
+                        if len(tag_parts) >= 4:  # cicd-build-{arch}-{upload_id}
+                            architecture = tag_parts[2]
+                            upload_id_short = tag_parts[3]
+                            images.append({
+                                "name": image_info['Repository'],
+                                "tag": image_info['Tag'],
+                                "architecture": architecture,
+                                "upload_id_short": upload_id_short,
+                                "size": image_info['Size'],
+                                "created": image_info['CreatedSince']
+                            })
+                    except json.JSONDecodeError:
+                        pass
+            return images
+        else:
+            return []
+    except Exception as e:
+        print(f"Error listing Docker images: {e}")
+        return []
+
 @app.route("/status", methods=["GET"])
 def get_status():
-    """Get the current status of chunked uploads and extracted directories"""
+    """Get the current status of chunked uploads, extracted directories, and built Docker images"""
     status = {}
     for upload_key, info in chunk_tracker.items():
         status[upload_key] = {
@@ -260,9 +377,13 @@ def get_status():
             except ValueError:
                 pass
     
+    # Get built Docker images
+    docker_images = get_built_docker_images()
+    
     return jsonify({
         "active_uploads": status,
-        "extracted_directories": extracted_dirs
+        "extracted_directories": extracted_dirs,
+        "docker_images": docker_images
     }), 200
 
 
@@ -303,13 +424,37 @@ def cleanup_temp_files():
             except OSError as e:
                 print(f"Failed to remove directory {item}: {e}")
     
+    # Clean up Docker images built by this server
+    docker_cleanup_count = 0
+    try:
+        cmd = ["docker", "images", "-q", "--filter", "reference=cicd-build-*"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            image_ids = result.stdout.strip().split('\n')
+            for image_id in image_ids:
+                if image_id:  # Skip empty lines
+                    try:
+                        rm_cmd = ["docker", "rmi", "-f", image_id]
+                        rm_result = subprocess.run(rm_cmd, capture_output=True, text=True)
+                        if rm_result.returncode == 0:
+                            docker_cleanup_count += 1
+                            print(f"Removed Docker image: {image_id}")
+                        else:
+                            print(f"Failed to remove Docker image {image_id}: {rm_result.stderr}")
+                    except Exception as e:
+                        print(f"Error removing Docker image {image_id}: {e}")
+    except Exception as e:
+        print(f"Error during Docker cleanup: {e}")
+    
     # Clear the tracker
     chunk_tracker.clear()
     
     return jsonify({
-        "message": f"Cleaned up {cleanup_count} temporary files and {extracted_cleanup_count} extracted directories",
+        "message": f"Cleaned up {cleanup_count} temporary files, {extracted_cleanup_count} extracted directories, and {docker_cleanup_count} Docker images",
         "temp_files_cleaned": cleanup_count,
         "directories_cleaned": extracted_cleanup_count,
+        "docker_images_cleaned": docker_cleanup_count,
         "tracker_cleared": True
     }), 200
 
