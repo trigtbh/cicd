@@ -1,5 +1,7 @@
 import argparse
 import os
+import config
+import requests
 
 def main():
     parser = argparse.ArgumentParser(description="Package and send a folder for CI/CD deployment")
@@ -23,6 +25,12 @@ def main():
     os.system(f"tar -czf {archive_name} {target_folder}")
     
     print(f"Created archive: {archive_name}")
+
+
+    # Send the archive to the server alongside the tag
+    with open(archive_name, "rb") as f:
+        response = requests.post(config.server, files={"file": f, "architecture": architecture})
+        print(f"Server response: {response.text}")
 
 if __name__ == "__main__":
     main()
