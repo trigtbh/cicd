@@ -1,13 +1,17 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import os
 import uuid
 import json
 import subprocess
+import time
 
 app = Flask(__name__)
 
 # Dictionary to track chunked uploads
 chunk_tracker = {}
+
+# Dictionary to track exported image chunks available for download
+image_chunks = {}
 
 def extract_tar_file(tar_file_path, extract_id):
     """Extract tar file to a unique directory"""
@@ -87,6 +91,59 @@ def build_docker_image(extract_dir, architecture, upload_id):
     except Exception as e:
         print(f"✗ Error during Docker build: {str(e)}")
         return False, f"Error during Docker build: {str(e)}"
+
+def export_and_split_docker_image(image_name, upload_id, chunk_size_mb=5):
+    """Export Docker image and split it into chunks"""
+    try:
+        # Export the Docker image to a tar file
+        export_filename = f"docker_image_{upload_id[:8]}.tar"
+        export_path = f"./{export_filename}"
+        
+        print(f"Exporting Docker image {image_name} to {export_path}...")
+        
+        # Export Docker image
+        export_cmd = ["docker", "save", "-o", export_path, image_name]
+        result = subprocess.run(export_cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            return False, f"Failed to export Docker image: {result.stderr}"
+        
+        print(f"✓ Successfully exported Docker image to {export_path}")
+        
+        # Split the exported tar file into chunks
+        chunk_size_bytes = int(chunk_size_mb * 1024 * 1024)
+        chunk_files = []
+        
+        with open(export_path, 'rb') as f:
+            chunk_num = 0
+            while True:
+                chunk_data = f.read(chunk_size_bytes)
+                if not chunk_data:
+                    break
+                
+                chunk_filename = f"image_chunk_{upload_id[:8]}_{chunk_num:03d}.tar"
+                chunk_path = f"./{chunk_filename}"
+                
+                with open(chunk_path, 'wb') as chunk_file:
+                    chunk_file.write(chunk_data)
+                
+                chunk_files.append(chunk_filename)
+                print(f"Created image chunk: {chunk_filename} ({len(chunk_data)} bytes)")
+                chunk_num += 1
+        
+        # Remove the original export file
+        os.remove(export_path)
+        print(f"✓ Cleaned up export file: {export_path}")
+        
+        return True, {
+            "chunk_files": chunk_files,
+            "total_chunks": len(chunk_files),
+            "original_size": os.path.getsize(chunk_files[0]) * (len(chunk_files) - 1) + os.path.getsize(chunk_files[-1]) if chunk_files else 0
+        }
+        
+    except Exception as e:
+        print(f"✗ Error during Docker image export/split: {str(e)}")
+        return False, f"Error during Docker image export/split: {str(e)}"
 
 def combine_chunks(original_filename, total_chunks, upload_id):
     """Combine all chunks into the original file"""
@@ -222,16 +279,46 @@ def receive_data():
                         build_success, build_result = build_docker_image(extract_result, architecture, upload_id)
                         
                         if build_success:
-                            print(f"✓ Successfully combined, extracted, and built Docker image for {original_filename}")
-                            return jsonify({
-                                "message": f"All chunks received, combined, extracted, and Docker image built successfully",
-                                "id": upload_id,
-                                "architecture": architecture,
-                                "filename": original_filename,
-                                "extracted_to": extract_result,
-                                "docker_image": build_result["image_name"],
-                                "platform": build_result["platform"]
-                            }), 200
+                            # Export and split the Docker image
+                            export_success, export_result = export_and_split_docker_image(
+                                build_result["image_name"], upload_id
+                            )
+                            
+                            if export_success:
+                                # Store chunk information for download
+                                image_chunks[upload_id] = {
+                                    "image_name": build_result["image_name"],
+                                    "architecture": architecture,
+                                    "chunk_files": export_result["chunk_files"],
+                                    "total_chunks": export_result["total_chunks"],
+                                    "original_size": export_result["original_size"],
+                                    "created_at": time.time()
+                                }
+                                
+                                print(f"✓ Successfully combined, extracted, built, and exported Docker image for {original_filename}")
+                                return jsonify({
+                                    "message": f"All chunks received, combined, extracted, Docker image built and exported successfully",
+                                    "id": upload_id,
+                                    "architecture": architecture,
+                                    "filename": original_filename,
+                                    "extracted_to": extract_result,
+                                    "docker_image": build_result["image_name"],
+                                    "platform": build_result["platform"],
+                                    "image_chunks_available": export_result["total_chunks"],
+                                    "image_size": export_result["original_size"]
+                                }), 200
+                            else:
+                                print(f"✓ Successfully built Docker image but export failed: {export_result}")
+                                return jsonify({
+                                    "message": f"All chunks received, combined, extracted, and Docker image built successfully, but export failed",
+                                    "id": upload_id,
+                                    "architecture": architecture,
+                                    "filename": original_filename,
+                                    "extracted_to": extract_result,
+                                    "docker_image": build_result["image_name"],
+                                    "platform": build_result["platform"],
+                                    "export_error": export_result
+                                }), 200
                         else:
                             print(f"✓ Successfully combined and extracted, but Docker build failed: {build_result}")
                             return jsonify({
@@ -280,16 +367,46 @@ def receive_data():
                     build_success, build_result = build_docker_image(extract_result, architecture, upload_id)
                     
                     if build_success:
-                        print(f"✓ Successfully received, extracted, and built Docker image for {file.filename}")
-                        return jsonify({
-                            "message": "File received, extracted, and Docker image built successfully", 
-                            "id": upload_id,
-                            "architecture": architecture,
-                            "filename": file.filename,
-                            "extracted_to": extract_result,
-                            "docker_image": build_result["image_name"],
-                            "platform": build_result["platform"]
-                        }), 200
+                        # Export and split the Docker image
+                        export_success, export_result = export_and_split_docker_image(
+                            build_result["image_name"], upload_id
+                        )
+                        
+                        if export_success:
+                            # Store chunk information for download
+                            image_chunks[upload_id] = {
+                                "image_name": build_result["image_name"],
+                                "architecture": architecture,
+                                "chunk_files": export_result["chunk_files"],
+                                "total_chunks": export_result["total_chunks"],
+                                "original_size": export_result["original_size"],
+                                "created_at": time.time()
+                            }
+                            
+                            print(f"✓ Successfully received, extracted, built, and exported Docker image for {file.filename}")
+                            return jsonify({
+                                "message": "File received, extracted, Docker image built and exported successfully", 
+                                "id": upload_id,
+                                "architecture": architecture,
+                                "filename": file.filename,
+                                "extracted_to": extract_result,
+                                "docker_image": build_result["image_name"],
+                                "platform": build_result["platform"],
+                                "image_chunks_available": export_result["total_chunks"],
+                                "image_size": export_result["original_size"]
+                            }), 200
+                        else:
+                            print(f"✓ Successfully built Docker image but export failed: {export_result}")
+                            return jsonify({
+                                "message": "File received, extracted, and Docker image built successfully, but export failed",
+                                "id": upload_id,
+                                "architecture": architecture,
+                                "filename": file.filename,
+                                "extracted_to": extract_result,
+                                "docker_image": build_result["image_name"],
+                                "platform": build_result["platform"],
+                                "export_error": export_result
+                            }), 200
                     else:
                         print(f"✓ Successfully received and extracted, but Docker build failed: {build_result}")
                         return jsonify({
@@ -316,6 +433,78 @@ def receive_data():
     except Exception as e:
         print(f"✗ Error in receive_data: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/image/<upload_id>/info", methods=["GET"])
+def get_image_info(upload_id):
+    """Get information about available image chunks for download"""
+    if upload_id not in image_chunks:
+        return jsonify({"error": "Image chunks not found for this upload ID"}), 404
+    
+    chunk_info = image_chunks[upload_id]
+    return jsonify({
+        "upload_id": upload_id,
+        "image_name": chunk_info["image_name"],
+        "architecture": chunk_info["architecture"],
+        "total_chunks": chunk_info["total_chunks"],
+        "original_size": chunk_info["original_size"],
+        "created_at": chunk_info["created_at"],
+        "chunk_files": chunk_info["chunk_files"]
+    }), 200
+
+
+@app.route("/image/<upload_id>/chunk/<int:chunk_index>", methods=["GET"])
+def download_image_chunk(upload_id, chunk_index):
+    """Download a specific chunk of the Docker image"""
+    if upload_id not in image_chunks:
+        return jsonify({"error": "Image chunks not found for this upload ID"}), 404
+    
+    chunk_info = image_chunks[upload_id]
+    
+    if chunk_index < 0 or chunk_index >= chunk_info["total_chunks"]:
+        return jsonify({"error": f"Invalid chunk index. Valid range: 0-{chunk_info['total_chunks']-1}"}), 400
+    
+    chunk_filename = chunk_info["chunk_files"][chunk_index]
+    chunk_path = f"./{chunk_filename}"
+    
+    if not os.path.exists(chunk_path):
+        return jsonify({"error": f"Chunk file {chunk_filename} not found"}), 404
+    
+    try:
+        print(f"Sending chunk {chunk_index + 1}/{chunk_info['total_chunks']}: {chunk_filename}")
+        return send_file(chunk_path, as_attachment=True, download_name=chunk_filename)
+    except Exception as e:
+        return jsonify({"error": f"Failed to send chunk: {str(e)}"}), 500
+
+
+@app.route("/image/<upload_id>/complete", methods=["POST"])
+def mark_image_download_complete(upload_id):
+    """Mark image download as complete and clean up chunks"""
+    if upload_id not in image_chunks:
+        return jsonify({"error": "Image chunks not found for this upload ID"}), 404
+    
+    chunk_info = image_chunks[upload_id]
+    cleanup_count = 0
+    
+    # Clean up chunk files
+    for chunk_filename in chunk_info["chunk_files"]:
+        chunk_path = f"./{chunk_filename}"
+        try:
+            if os.path.exists(chunk_path):
+                os.remove(chunk_path)
+                cleanup_count += 1
+                print(f"Cleaned up image chunk: {chunk_filename}")
+        except OSError as e:
+            print(f"Failed to remove chunk {chunk_filename}: {e}")
+    
+    # Remove from tracking
+    del image_chunks[upload_id]
+    
+    return jsonify({
+        "message": f"Image download marked complete, cleaned up {cleanup_count} chunk files",
+        "upload_id": upload_id,
+        "chunks_cleaned": cleanup_count
+    }), 200
 
 
 def get_built_docker_images():
@@ -352,10 +541,43 @@ def get_built_docker_images():
     except Exception as e:
         print(f"Error listing Docker images: {e}")
         return []
+    """Get list of Docker images built by this server"""
+    try:
+        # List Docker images with our naming pattern
+        cmd = ["docker", "images", "--format", "json", "--filter", "reference=cicd-build-*"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            images = []
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    try:
+                        image_info = json.loads(line)
+                        # Parse architecture and upload_id from image name
+                        tag_parts = image_info['Repository'].split('-')
+                        if len(tag_parts) >= 4:  # cicd-build-{arch}-{upload_id}
+                            architecture = tag_parts[2]
+                            upload_id_short = tag_parts[3]
+                            images.append({
+                                "name": image_info['Repository'],
+                                "tag": image_info['Tag'],
+                                "architecture": architecture,
+                                "upload_id_short": upload_id_short,
+                                "size": image_info['Size'],
+                                "created": image_info['CreatedSince']
+                            })
+                    except json.JSONDecodeError:
+                        pass
+            return images
+        else:
+            return []
+    except Exception as e:
+        print(f"Error listing Docker images: {e}")
+        return []
 
 @app.route("/status", methods=["GET"])
 def get_status():
-    """Get the current status of chunked uploads, extracted directories, and built Docker images"""
+    """Get the current status of chunked uploads, extracted directories, built Docker images, and available image chunks"""
     status = {}
     for upload_key, info in chunk_tracker.items():
         status[upload_key] = {
@@ -380,10 +602,22 @@ def get_status():
     # Get built Docker images
     docker_images = get_built_docker_images()
     
+    # Get available image chunks for download
+    available_images = {}
+    for upload_id, chunk_info in image_chunks.items():
+        available_images[upload_id] = {
+            "image_name": chunk_info["image_name"],
+            "architecture": chunk_info["architecture"],
+            "total_chunks": chunk_info["total_chunks"],
+            "original_size": chunk_info["original_size"],
+            "created_at": chunk_info["created_at"]
+        }
+    
     return jsonify({
         "active_uploads": status,
         "extracted_directories": extracted_dirs,
-        "docker_images": docker_images
+        "docker_images": docker_images,
+        "available_image_chunks": available_images
     }), 200
 
 
@@ -402,6 +636,13 @@ def cleanup_temp_files():
                 pass
         # Clean up leftover received tar files
         elif filename.startswith('received_') and filename.endswith('.tar.gz'):
+            try:
+                os.remove(filename)
+                cleanup_count += 1
+            except OSError:
+                pass
+        # Clean up image chunk files
+        elif filename.startswith('image_chunk_') and filename.endswith('.tar'):
             try:
                 os.remove(filename)
                 cleanup_count += 1
@@ -447,8 +688,9 @@ def cleanup_temp_files():
     except Exception as e:
         print(f"Error during Docker cleanup: {e}")
     
-    # Clear the tracker
+    # Clear the trackers
     chunk_tracker.clear()
+    image_chunks.clear()
     
     return jsonify({
         "message": f"Cleaned up {cleanup_count} temporary files, {extracted_cleanup_count} extracted directories, and {docker_cleanup_count} Docker images",
