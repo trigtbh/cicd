@@ -65,7 +65,7 @@ def build_docker_image(extract_dir, architecture, upload_id):
         
         # Build Docker command
         cmd = [
-            "docker", "build",
+            "docker", "buildx", "build",
             "--platform", platform,
             "-t", image_name,
             extract_dir
