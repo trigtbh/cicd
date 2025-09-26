@@ -29,7 +29,7 @@ def main():
 
     # Send the archive to the server alongside the tag
     with open(archive_name, "rb") as f:
-        response = requests.post(config.server, files={"file": f, "architecture": architecture})
+        response = requests.post(config.server.strip("/") + "/data", files={"file": f, "architecture": architecture})
         print(f"Server response: {response.text}")
 
 if __name__ == "__main__":
