@@ -2,11 +2,41 @@ from flask import Flask, request, jsonify
 import os
 import uuid
 import json
+import subprocess
 
 app = Flask(__name__)
 
 # Dictionary to track chunked uploads
 chunk_tracker = {}
+
+def extract_tar_file(tar_file_path, extract_id):
+    """Extract tar file to a unique directory"""
+    try:
+        # Create extraction directory with unique ID
+        extract_dir = f"./{extract_id}"
+        
+        # Create directory if it doesn't exist
+        os.makedirs(extract_dir, exist_ok=True)
+        
+        # Extract tar file with strip-components=1
+        cmd = ["tar", "-xzf", tar_file_path, "-C", extract_dir, "--strip-components=1"]
+        
+        print(f"Extracting {tar_file_path} to {extract_dir}...")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"✓ Successfully extracted to {extract_dir}")
+            # Remove the tar file after successful extraction
+            os.remove(tar_file_path)
+            print(f"✓ Cleaned up tar file: {tar_file_path}")
+            return True, extract_dir
+        else:
+            print(f"✗ Extraction failed: {result.stderr}")
+            return False, f"Extraction failed: {result.stderr}"
+    
+    except Exception as e:
+        print(f"✗ Error during extraction: {str(e)}")
+        return False, f"Error during extraction: {str(e)}"
 
 def combine_chunks(original_filename, total_chunks, upload_id):
     """Combine all chunks into the original file"""
@@ -130,15 +160,31 @@ def receive_data():
                 success, message = combine_chunks(original_filename, total_chunks, upload_id)
                 
                 if success:
+                    # Extract the combined tar file
+                    tar_file_path = f"./received_{original_filename}"
+                    extract_success, extract_result = extract_tar_file(tar_file_path, upload_id)
+                    
                     # Clean up tracking
                     del chunk_tracker[upload_key]
-                    print(f"✓ Successfully combined {original_filename}")
-                    return jsonify({
-                        "message": f"All chunks received and combined successfully",
-                        "id": upload_id,
-                        "architecture": architecture,
-                        "filename": original_filename
-                    }), 200
+                    
+                    if extract_success:
+                        print(f"✓ Successfully combined and extracted {original_filename}")
+                        return jsonify({
+                            "message": f"All chunks received, combined, and extracted successfully",
+                            "id": upload_id,
+                            "architecture": architecture,
+                            "filename": original_filename,
+                            "extracted_to": extract_result
+                        }), 200
+                    else:
+                        print(f"✗ Combined successfully but extraction failed: {extract_result}")
+                        return jsonify({
+                            "message": f"All chunks received and combined successfully, but extraction failed",
+                            "id": upload_id,
+                            "architecture": architecture,
+                            "filename": original_filename,
+                            "extraction_error": extract_result
+                        }), 200
                 else:
                     return jsonify({"error": f"Failed to combine chunks: {message}"}), 500
             else:
@@ -155,18 +201,35 @@ def receive_data():
             
             print(f"Receiving single file: {file.filename}")
             
+            tar_file_path = f"./received_{file.filename}"
             try:
-                file.save(f"./received_{file.filename}")
+                file.save(tar_file_path)
                 print(f"✓ Successfully saved {file.filename}")
+                
+                # Extract the tar file
+                extract_success, extract_result = extract_tar_file(tar_file_path, upload_id)
+                
+                if extract_success:
+                    print(f"✓ Successfully received and extracted {file.filename}")
+                    return jsonify({
+                        "message": "File received and extracted successfully", 
+                        "id": upload_id,
+                        "architecture": architecture,
+                        "filename": file.filename,
+                        "extracted_to": extract_result
+                    }), 200
+                else:
+                    print(f"✗ Received successfully but extraction failed: {extract_result}")
+                    return jsonify({
+                        "message": "File received successfully, but extraction failed",
+                        "id": upload_id,
+                        "architecture": architecture,
+                        "filename": file.filename,
+                        "extraction_error": extract_result
+                    }), 200
+                    
             except Exception as e:
                 return jsonify({"error": f"Failed to save file: {str(e)}"}), 500
-            
-            return jsonify({
-                "message": "File received successfully", 
-                "id": upload_id,
-                "architecture": architecture,
-                "filename": file.filename
-            }), 200
     
     except Exception as e:
         print(f"✗ Error in receive_data: {str(e)}")
@@ -175,7 +238,7 @@ def receive_data():
 
 @app.route("/status", methods=["GET"])
 def get_status():
-    """Get the current status of chunked uploads"""
+    """Get the current status of chunked uploads and extracted directories"""
     status = {}
     for upload_key, info in chunk_tracker.items():
         status[upload_key] = {
@@ -185,13 +248,30 @@ def get_status():
             "architecture": info['architecture'],
             "original_filename": info['original_filename']
         }
-    return jsonify({"active_uploads": status}), 200
+    
+    # List extracted directories
+    extracted_dirs = []
+    for item in os.listdir('.'):
+        if os.path.isdir(item) and not item.startswith('.') and not item == '__pycache__':
+            # Check if it looks like a UUID (extracted directory)
+            try:
+                uuid.UUID(item)
+                extracted_dirs.append(item)
+            except ValueError:
+                pass
+    
+    return jsonify({
+        "active_uploads": status,
+        "extracted_directories": extracted_dirs
+    }), 200
 
 
 @app.route("/cleanup", methods=["POST"])
 def cleanup_temp_files():
-    """Clean up any leftover temporary files"""
+    """Clean up any leftover temporary files and extracted directories"""
     cleanup_count = 0
+    
+    # Clean up chunk files
     for filename in os.listdir('.'):
         if filename.startswith('temp_') and '_chunk_' in filename:
             try:
@@ -199,12 +279,37 @@ def cleanup_temp_files():
                 cleanup_count += 1
             except OSError:
                 pass
+        # Clean up leftover received tar files
+        elif filename.startswith('received_') and filename.endswith('.tar.gz'):
+            try:
+                os.remove(filename)
+                cleanup_count += 1
+            except OSError:
+                pass
+    
+    # Clean up extracted directories (UUID directories)
+    extracted_cleanup_count = 0
+    for item in os.listdir('.'):
+        if os.path.isdir(item) and not item.startswith('.') and not item == '__pycache__':
+            # Check if it looks like a UUID (extracted directory)
+            try:
+                uuid.UUID(item)
+                import shutil
+                shutil.rmtree(item)
+                extracted_cleanup_count += 1
+                print(f"Removed extracted directory: {item}")
+            except ValueError:
+                pass
+            except OSError as e:
+                print(f"Failed to remove directory {item}: {e}")
     
     # Clear the tracker
     chunk_tracker.clear()
     
     return jsonify({
-        "message": f"Cleaned up {cleanup_count} temporary files",
+        "message": f"Cleaned up {cleanup_count} temporary files and {extracted_cleanup_count} extracted directories",
+        "temp_files_cleaned": cleanup_count,
+        "directories_cleaned": extracted_cleanup_count,
         "tracker_cleared": True
     }), 200
 
